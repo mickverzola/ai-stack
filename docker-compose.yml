@@ -123,6 +123,9 @@ services:
       
       # mickverzola-website
       - ${WEBSITE_DIR}:/data/mickverzola-website
+      
+      # Let's Hermes access files attached through Open WebUI as an actual file and not a vector
+      - ${DATA_DIR:-./OpenWebUI}/OpenWebUI/data/uploads:/app/backend/data/uploads:ro
 
     environment:
       - API_SERVER_ENABLED=true
@@ -227,6 +230,8 @@ services:
     # Persist vector collections/memory across container recreation.
     volumes:
       - ${DATA_DIR:-./data}/qdrant/storage:/qdrant/storage
+      
+      - ${DATA_DIR}/OpenWebUI/data:/app/backend/data
 
     # Only private Hermes and Open WebUI need Qdrant in this design.
     # Keeping Qdrant off guest-network prevents Hermes Guest from directly
@@ -381,10 +386,10 @@ services:
       - PYTHONPATH=/root/venv/lib/python3.13/site-packages:/opt/venv/lib/python3.13/site-packages
 
     volumes:
-      - D:/ai-stack/comfyui/comfyui_models:/root/ComfyUI/models
-      - D:/ai-stack/comfyui/comfyui_output:/root/ComfyUI/output
-      - D:/ai-stack/comfyui/custom_nodes:/root/ComfyUI/custom_nodes
-      - D:/ai-stack/comfyui/user:/root/ComfyUI/user
+      - ${COMFYUI_DIR:-./comfyui}/comfyui_models:/root/ComfyUI/models
+      - ${COMFYUI_DIR:-./comfyui}/comfyui_output:/root/ComfyUI/output
+      - ${COMFYUI_DIR:-./comfyui}/custom_nodes:/root/ComfyUI/custom_nodes
+      - ${COMFYUI_DIR:-./comfyui}/user:/root/ComfyUI/user
 
     networks:
       - ai-network
