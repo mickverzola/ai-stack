@@ -1,0 +1,397 @@
+# ================================================================
+# Local AI Stack
+#
+# High-level design:
+#   - ai-network is the private/internal AI zone.
+#   - guest-network is the isolated zone for guest/test access.
+#   - Ollama is shared by both zones so both Hermes instances can use
+#     the same local LLM (currently Qwen 3.8:27B).
+#   - Hermes and Hermes Guest are separate agent instances with
+#     separate persistent data/workspaces to prevent private agent
+#     state from leaking into the guest environment.
+#   - Qdrant is shared as the semantic-memory/vector database.
+#     The intent is that memory can outlive a particular model/agent.
+#   - Obsidian is the shared personal knowledgebase used by Hermes,
+#     Open WebUI, and n8n.
+#   - Cloudflared provides the external entry point; localhost-only
+#     host bindings keep the application ports off the LAN/WAN.
+#   - n8n is attached to both zones because it serves both internal
+#     automation and the guest-facing Facebook Messenger experiment.
+#   - ComfyUI currently shares the same physical GPU as Ollama but
+#     is intended to be run separately because the available hardware
+#     cannot comfortably run both at once.
+# ================================================================
+
+networks:
+  # Private/internal trust zone for the personal AI environment.
+  ai-network:
+    name: ai-network
+    driver: bridge
+
+  # Guest/test trust zone. Hermes Guest lives here instead of the
+  # private AI network, so its container-level network reach is limited.
+  guest-network:
+    name: guest-network
+    driver: bridge
+
+services:
+  # ==============================================================
+  # Shared model server
+  # ==============================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+
+    # Expose Ollama only on the local host. Containers should normally
+    # reach it through Docker DNS as http://ollama:11434 instead.
+    ports:
+      - "127.0.0.1:11434:11434"
+
+    # Persist downloaded models outside the container lifecycle.
+    volumes:
+      - ${DATA_DIR:-./data}/ollama/models:/root/.ollama
+
+    environment:
+      # Listen on all container interfaces so both Docker networks can reach it.
+      - OLLAMA_HOST=0.0.0.0
+
+      # Keep models loaded for 15 minutes after use to reduce reload latency.
+      - OLLAMA_KEEP_ALIVE=15m
+
+      # Deliberately keep parallel request execution at 1, matching the
+      # current single-GPU resource strategy.
+      - OLLAMA_NUM_PARALLEL=1
+
+      # Permit up to two models (LLM and embedder) to remain loaded simultaneously.
+      - OLLAMA_MAX_LOADED_MODELS=2
+
+      # Large context window for the local agent workload.
+      - OLLAMA_CONTEXT_LENGTH=65536
+
+      # GPU-oriented inference optimizations.
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Ollama receives one NVIDIA GPU. This is the shared compute
+              # resource used by both Hermes instances.
+              count: 1
+              capabilities: [gpu]
+
+    # Ollama is considered ready when the CLI can successfully query it.
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    # Ollama intentionally bridges the private and guest zones because
+    # both Hermes instances use the same local model server.
+    networks:
+      - ai-network
+      - guest-network
+
+  # ==============================================================
+  # Personal/private Hermes agent
+  # ==============================================================
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+
+    # Local-only API exposure. Open WebUI talks to Hermes over Docker
+    # networking; this binding is primarily for local administration/testing.
+    ports:
+      - "127.0.0.1:8642:8642"
+
+    volumes:
+      # Private Hermes persistent application/agent data.
+      - ${DATA_DIR:-./data}/hermes/data:/opt/data
+
+      # Personal working folder intended to behave like a normal user workspace.
+      - ${DATA_DIR:-./data}/workspace:/workspace
+
+      # Shared Personal Knowledgebase (Obsidian vault).
+      - ${KNOWLEDGE_DIR:-./knowledge}:/data/obsidian
+
+    environment:
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8642
+      - API_SERVER_KEY=${HERMES_API_KEY}
+
+      # Hermes uses Ollama as its OpenAI-compatible inference endpoint.
+      - OPENAI_BASE_URL=http://ollama:11434/v1
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
+      # Only the persistent Hermes data directory and the shared Obsidian
+      # knowledgebase are declared as write-safe roots for this agent.
+      - HERMES_WRITE_SAFE_ROOT=/opt/data:/data/obsidian
+
+      # Hermes stores semantic memory in Qdrant instead of keeping that
+      # memory exclusively inside the agent/model runtime.
+      - MEM0_VECTOR_STORE_PROVIDER=qdrant
+      - MEM0_QDRANT_URL=http://qdrant:6333
+      - MEM0_QDRANT_HTTPS=false
+
+    # Start Hermes only after Ollama is healthy and Qdrant is running.
+    depends_on:
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8642/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+    # Private Hermes is intentionally confined to the private AI zone.
+    networks:
+      - ai-network
+
+  # ==============================================================
+  # Guest/test Hermes agent
+  # ==============================================================
+  hermes-guest:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-guest
+    restart: unless-stopped
+    command: gateway run
+
+    # No host port is required here. Open WebUI and n8n can reach this
+    # service through guest-network using the container DNS name.
+    volumes:
+      # Guest agent state is kept separate from personal Hermes state.
+      - ${DATA_DIR:-./data}/hermes-guest/data:/opt/data
+
+      # Guest users get their own workspace and do not mount the personal
+      # Obsidian knowledgebase.
+      - ${DATA_DIR:-./data}/guest-workspace:/workspace
+
+    environment:
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8642
+      - API_SERVER_KEY=${HERMES_GUEST_API_KEY}
+
+      # Guest Hermes uses the same Ollama model server as personal Hermes.
+      - OPENAI_BASE_URL=http://ollama:11434/v1
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
+      # Guest writes are restricted to the guest agent data and workspace.
+      - HERMES_WRITE_SAFE_ROOT=/opt/data:/workspace
+
+      # Present this agent as a distinct model/backend to Open WebUI.
+      - API_SERVER_MODEL_NAME=guest-agent
+
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8642/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+    # Guest Hermes is intentionally confined to guest-network.
+    networks:
+      - guest-network
+
+  # ==============================================================
+  # Shared semantic-memory database
+  # ==============================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+
+    # Local-only administration/API access.
+    ports:
+      - "127.0.0.1:6333:6333"
+
+    # Persist vector collections/memory across container recreation.
+    volumes:
+      - ${DATA_DIR:-./data}/qdrant/storage:/qdrant/storage
+
+    # Only private Hermes and Open WebUI need Qdrant in this design.
+    # Keeping Qdrant off guest-network prevents Hermes Guest from directly
+    # reaching the personal semantic-memory service.
+    networks:
+      - ai-network
+
+  # ==============================================================
+  # Shared user interface / control plane
+  # ==============================================================
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+
+    # Local host binding; Cloudflared reaches the container internally.
+    ports:
+      - "127.0.0.1:3000:8080"
+
+    volumes:
+      # Persist Open WebUI users, chats, configuration, etc.
+      - ${DATA_DIR:-./data}/OpenWebUI/data:/app/backend/data
+
+      # Expose the same Personal Knowledgebase to Open WebUI.
+      - ${KNOWLEDGE_DIR:-./knowledge}:/workspace/obsidian
+
+    environment:
+      # Direct Ollama backend for model access/embeddings.
+      - OLLAMA_BASE_URL=http://ollama:11434
+
+      # Register both private and guest Hermes backends. Access to the
+      # private Hermes backend for guest users must be controlled at the
+      # Open WebUI application/account layer; Docker network separation
+      # alone cannot isolate users sharing this Open WebUI instance.
+      - OPENAI_API_BASE_URLS=http://hermes:8642/v1;http://hermes-guest:8642/v1
+      - OPENAI_API_KEYS=${HERMES_API_KEY};${HERMES_GUEST_API_KEY}
+
+      # Secret used to protect the Open WebUI application/session data.
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+
+      # Disable self-service account creation; access is intentionally controlled.
+      - ENABLE_SIGNUP=false
+
+      # Use Qdrant for vector storage.
+      - VECTOR_DB=qdrant
+      - QDRANT_URI=http://qdrant:6333
+
+      # Embeddings run on CPU to conserve GPU/VRAM for LLM inference.
+      - EMBEDDING_ENGINE=ollama
+      - EMBEDDING_MODEL=nomic-embed-text-cpu
+
+    depends_on:
+      ollama:
+        condition: service_healthy
+      hermes:
+        condition: service_healthy
+      hermes-guest:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+    # Open WebUI is the shared control plane and therefore bridges both
+    # trust zones. This is intentional for the guest-account experience.
+    networks:
+      - ai-network
+      - guest-network
+
+  # ==============================================================
+  # Cloudflare external ingress
+  # ==============================================================
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+
+    environment:
+      # Cloudflare Tunnel configuration is supplied through the environment.
+      # The actual hostname -> service routing is configured in Cloudflare,
+      # not in this compose file.
+      - TUNNEL_TOKEN=${CLOUDFLARE_TOKEN}
+
+    depends_on:
+      open-webui:
+        condition: service_started
+
+    # Cloudflared bridges both zones so it can reach the externally exposed
+    # services configured in the Cloudflare tunnel (for example Open WebUI
+    # and n8n). Exact public hostnames are defined outside this file.
+    networks:
+      - ai-network
+      - guest-network
+
+  # ==============================================================
+  # Workflow automation
+  # ==============================================================
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+
+    # Local host binding; public webhook/UI traffic is expected to enter
+    # through the Cloudflare Tunnel instead of this host port.
+    ports:
+      - "127.0.0.1:5678:5678"
+
+    volumes:
+      # Persist n8n workflows, credentials, execution metadata, etc.
+      - ${DATA_DIR:-./data}/n8n_data:/home/node/.n8n
+
+      # Allow automation workflows to use the Personal Knowledgebase.
+      - ${KNOWLEDGE_DIR:-./knowledge}:/files/obsidian
+
+    environment:
+      - N8N_HOST=n8n.mickverzola.com
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://n8n.mickverzola.com/
+      - GENERIC_TIMEZONE=Asia/Manila
+
+    depends_on:
+      # Current compose expresses an Ollama dependency; actual workflow
+      # connectivity to Hermes Guest is expected over guest-network.
+      - ollama
+        # NOTE: Docker Compose's depends_on syntax is intentionally preserved
+        # below in the same shape as the original file.
+        # The n8n workflows themselves determine which services they call.
+
+    networks:
+      # Private side: allows future/internal AI automation.
+      - ai-network
+      # Guest side: required for the Facebook Messenger -> n8n -> Hermes Guest
+      # automation/test flow.
+      - guest-network
+
+  # ==============================================================
+  # Image/video generation workload
+  # ==============================================================
+  comfyui:
+    image: yanwk/comfyui-boot:cu130-megapak-pt211
+    container_name: comfyui
+    shm_size: 8gb
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8188:8188"
+
+    environment:
+      - CLI_ARGS=--listen 0.0.0.0 --port 8188 --disable-smart-memory
+      - PATH=/root/venv/bin:/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - PYTHONPATH=/root/venv/lib/python3.13/site-packages:/opt/venv/lib/python3.13/site-packages
+
+    volumes:
+      - D:/ai-stack/comfyui/comfyui_models:/root/ComfyUI/models
+      - D:/ai-stack/comfyui/comfyui_output:/root/ComfyUI/output
+      - D:/ai-stack/comfyui/custom_nodes:/root/ComfyUI/custom_nodes
+      - D:/ai-stack/comfyui/user:/root/ComfyUI/user
+
+    networks:
+      - ai-network
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 32g

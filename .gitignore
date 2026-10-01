@@ -1,0 +1,55 @@
+# ==============================================================================
+# 1. Environment Secrets (CRITICAL)
+# ==============================================================================
+# Ignores your real API keys and tokens (.env.example will still be tracked).
+.env
+.env.local
+.env.*
+*.env
+
+# ==============================================================================
+# 2. Local Service Data & Vector Databases
+# ==============================================================================
+# Excludes local state for containers (chats, databases, model weights, logs).
+Hermes/
+Hermes-guest/
+n8n_data/
+Ollama/
+OpenWebUI/
+Qdrant/
+
+# ==============================================================================
+# 3. Workspaces & Knowledge Bases
+# ==============================================================================
+# Excludes personal Obsidian notes and local agent working directories.
+ai-knowledge/
+Workspace/
+Guest-Workspace/
+
+# ==============================================================================
+# 4. ComfyUI Outputs, Custom Nodes, & Large Model Weights
+# ==============================================================================
+# Excludes heavy AI model models, custom node packages, and generated images.
+ComfyUI/
+*.ckpt
+*.safetensors
+*.pt
+*.bin
+*.onnx
+
+# ==============================================================================
+# 5. Backup Files
+# ==============================================================================
+# Ignores the docker-compose backups visible in your directory.
+*.bak
+*.old
+*.tmp
+
+# ==============================================================================
+# 6. OS & Editor Junk
+# ==============================================================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
