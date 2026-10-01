@@ -120,6 +120,9 @@ services:
 
       # Shared Personal Knowledgebase (Obsidian vault).
       - ${KNOWLEDGE_DIR:-./knowledge}:/data/obsidian
+      
+      # mickverzola-website
+      - ${WEBSITE_DIR}:/data/mickverzola-website
 
     environment:
       - API_SERVER_ENABLED=true
